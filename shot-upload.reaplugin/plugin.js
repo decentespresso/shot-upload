@@ -23,7 +23,7 @@ function createPlugin(host) {
   "use strict";
 
   const NS = "shot-upload.reaplugin";
-  const VERSION = "0.2.2";
+  const VERSION = "0.2.3";
   const LOCAL_API_URL = "http://localhost:8080/api/v1";
   const UPLOAD_PATH = "support/api/shot_upload"; // exact allowlisted proxy write path
   // Web view of an uploaded shot in the user's Decent account. The server returns
@@ -43,9 +43,12 @@ function createPlugin(host) {
 
   let isUploading = false;
   let isReconciling = false;
-  let pendingLiveShotIds = [];
+  let pendingLiveShots = [];
   const remotelyPostedShotIds = new Set();
   const permanentlyRejectedShotIds = new Set();
+  let uploadedMachinesByShotId = new Map();
+  let uploadedRevisionsByShotId = new Map();
+  let pendingReplacementShotIds = new Set();
   let reconcileTimerId = null;
   let reconciliationPausedForConsent = false;
   let unloaded = false;
@@ -110,6 +113,7 @@ function createPlugin(host) {
         decent_upload_rejected: {
           status: error.status,
           timestamp: Math.floor(Date.now() / 1000),
+          ...(error.updatedAt ? { updatedAt: error.updatedAt } : {}),
         },
       });
     } catch (e) {
@@ -144,7 +148,18 @@ function createPlugin(host) {
     };
   }
 
-  async function withMachine(shot, manualRetry) {
+  function recordUploadedMachine(shotId, machine) {
+    uploadedMachinesByShotId = new Map([...uploadedMachinesByShotId, [shotId, { ...machine }]]);
+    try { host.storage({ type: "write", key: "uploadedMachines", data: Object.fromEntries(uploadedMachinesByShotId) }); } catch (e) {}
+  }
+
+  function recordUploadedRevision(shot) {
+    if (!shot || typeof shot.updatedAt !== "string" || !shot.updatedAt) return;
+    uploadedRevisionsByShotId = new Map([...uploadedRevisionsByShotId, [shot.id, shot.updatedAt]]);
+    try { host.storage({ type: "write", key: "uploadedRevisions", data: Object.fromEntries(uploadedRevisionsByShotId) }); } catch (e) {}
+  }
+
+  async function withMachine(shot, manualRetry, replacementMachine) {
     const captured = shot && shot.workflow && shot.workflow.machine;
     let machine = capturedMachine(shot);
     if (captured && captured.serialNumber && !machine) return null;
@@ -152,11 +167,18 @@ function createPlugin(host) {
     if (hasProvenanceStatus) {
       if (captured.provenanceStatus === "captured" && !machine) return null;
       if (captured.provenanceStatus === "unavailable") {
-        if (!manualRetry) return null;
-        machine = null;
+        if (replacementMachine !== undefined) machine = replacementMachine;
+        else {
+          if (!manualRetry) return null;
+          machine = null;
+        }
       } else if (captured.provenanceStatus !== "captured") {
         return null;
       }
+    }
+    if (!machine && replacementMachine !== undefined) {
+      if (!replacementMachine) return null;
+      machine = replacementMachine;
     }
     if (!machine) {
       const current = await fetchLocal("/machine/info");
@@ -177,7 +199,7 @@ function createPlugin(host) {
   }
 
   // POST the shot through the authenticated Decent proxy (reuses account login).
-  async function postShot(shot) {
+  async function postShot(shot, replace) {
     const body = JSON.stringify(shot);
     let lastErr = null;
     for (let i = 0; i < RETRIES; i++) {
@@ -190,6 +212,7 @@ function createPlugin(host) {
       try {
         const res = await host.decentProxy(UPLOAD_PATH, {
           method: "POST",
+          query: replace ? { replace: "1" } : {},
           body: body,
           contentType: "application/json",
         });
@@ -222,39 +245,53 @@ function createPlugin(host) {
     return shot && shot.annotations && shot.annotations.extras || {};
   }
 
-  function skipped(message) {
+  function skipped(message, terminal = false) {
     const error = new Error(message);
     error.skipped = true;
+    error.terminal = terminal;
     return error;
   }
 
-  async function uploadShot(shotId, manualRetry) {
-    if (remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`);
-    if (!manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`);
+  async function uploadShot(shotId, { manualRetry = false, replace = false } = {}) {
+    if (!replace && remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`, true);
+    if (!replace && !manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`, true);
     const full = await fetchLocal(`/shots/${shotId}`);
-    if (!full || !full.id) throw skipped(`shot ${shotId} not found`);
+    if (!full || !full.id) throw skipped(`shot ${shotId} not found`, true);
 
     const extras = extrasFor(full);
-    if (extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`);
-    if (extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`);
-    if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`);
+    if (!replace && extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`, true);
+    if (!replace && extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`, true);
+    if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`, true);
 
     const dur = shotDuration(full);
-    if (dur < state.lengthThreshold) {
-      throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`);
+    if (!replace && dur < state.lengthThreshold) {
+      throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`, true);
     }
 
-    const payload = await withMachine(full, manualRetry);
-    if (!payload) throw skipped("no real machine serial available");
+    const replacementMachine = replace ? (uploadedMachinesByShotId.get(full.id) || null) : undefined;
+    const payload = await withMachine(full, manualRetry, replacementMachine);
+    if (!payload) {
+      const captured = full.workflow && full.workflow.machine;
+      const hasProvenanceStatus = captured && Object.prototype.hasOwnProperty.call(captured, "provenanceStatus");
+      const terminal = replace || (!manualRetry && Boolean(captured) && (hasProvenanceStatus
+        ? captured.provenanceStatus !== "captured" || capturedMachine(full) === null
+        : Boolean(captured.serialNumber) && capturedMachine(full) === null));
+      throw skipped("no real machine serial available", terminal);
+    }
 
     let result;
     try {
-      result = await postShot(payload);
+      result = await postShot(payload, replace);
     } catch (e) {
-      if (e.permanent) permanentlyRejectedShotIds.add(full.id);
+      if (e.permanent) {
+        permanentlyRejectedShotIds.add(full.id);
+        if (typeof full.updatedAt === "string" && full.updatedAt) e.updatedAt = full.updatedAt;
+      }
       throw e;
     }
     remotelyPostedShotIds.add(full.id);
+    recordUploadedMachine(full.id, payload.machine);
+    recordUploadedRevision(full);
     await markUploaded(full.id);
     state.lastUploadedShot = full.id;
     state.lastResult = result;
@@ -277,30 +314,58 @@ function createPlugin(host) {
     return result;
   }
 
-  function queueLiveShot(shotId) {
-    if (!pendingLiveShotIds.includes(shotId)) {
-      pendingLiveShotIds = [...pendingLiveShotIds, shotId];
-    }
+  function queueLiveShot(operation) {
+    const queued = pendingLiveShots.find((item) => item.shotId === operation.shotId);
+    pendingLiveShots = queued
+      ? pendingLiveShots.map((item) => item.shotId === operation.shotId
+        ? { shotId: item.shotId, replace: item.replace || operation.replace }
+        : item)
+      : [...pendingLiveShots, operation];
   }
 
   function takeLiveShot() {
-    const shotId = pendingLiveShotIds[0];
-    pendingLiveShotIds = pendingLiveShotIds.slice(1);
-    return shotId;
+    const operation = pendingLiveShots[0];
+    pendingLiveShots = pendingLiveShots.slice(1);
+    return operation;
   }
 
-  async function uploadAutomatically(shotId) {
-    if (shotId && shotId === state.lastUploadedShot) {
+  function persistPendingReplacements() {
+    try { host.storage({ type: "write", key: "pendingReplacementShotIds", data: [...pendingReplacementShotIds] }); } catch (e) {}
+  }
+
+  function markReplacementPending(shotId) {
+    if (pendingReplacementShotIds.has(shotId)) return;
+    pendingReplacementShotIds = new Set([...pendingReplacementShotIds, shotId]);
+    persistPendingReplacements();
+  }
+
+  function clearReplacementPending(shotId) {
+    if (!pendingReplacementShotIds.has(shotId)) return;
+    pendingReplacementShotIds = new Set([...pendingReplacementShotIds].filter((id) => id !== shotId));
+    persistPendingReplacements();
+  }
+
+  async function uploadAutomatically(operation) {
+    const { shotId, replace } = operation;
+    if (replace) markReplacementPending(shotId);
+    if (!replace && shotId && shotId === state.lastUploadedShot) {
       log(`shot ${shotId} already uploaded`);
       return;
     }
     try {
-      const r = await uploadShot(shotId, false);
+      const r = await uploadShot(shotId, { replace });
+      if (replace) {
+        clearReplacementPending(shotId);
+        permanentlyRejectedShotIds.delete(shotId);
+      }
       log(`uploaded ${shotId} -> ${r && r.profile_ref ? r.profile_ref : "ok"}`);
+      return null;
     } catch (e) {
+      if (replace && e.skipped && e.terminal) clearReplacementPending(shotId);
       if (e.skipped) { log(`skipped ${shotId}: ${e.message}`); }
       else {
         if (e.permanent) {
+          if (replace) clearReplacementPending(shotId);
           await markRejected(shotId, e);
         }
         log(`error uploading ${shotId}: ${e.message}`);
@@ -308,22 +373,24 @@ function createPlugin(host) {
         if (e.consent) reconciliationPausedForConsent = true;
         else scheduleReconcile(RECONCILE_RETRY_MS);
       }
+      return e;
     }
   }
 
-  async function autoUpload(shotId) {
+  async function autoUpload(shotId, replace = false) {
     if (!state.autoUpload || reconciliationPausedForConsent || unloaded) return;
+    const operation = { shotId, replace };
     if (isUploading || isReconciling) {
-      queueLiveShot(shotId);
+      queueLiveShot(operation);
       return;
     }
     isUploading = true;
     try {
-      await uploadAutomatically(shotId);
+      await uploadAutomatically(operation);
     } finally {
       isUploading = false;
-      const nextShotId = takeLiveShot();
-      if (nextShotId) autoUpload(nextShotId);
+      const nextOperation = takeLiveShot();
+      if (nextOperation) autoUpload(nextOperation.shotId, nextOperation.replace);
     }
   }
 
@@ -361,7 +428,7 @@ function createPlugin(host) {
     const extras = extrasFor(shot);
     const captured = shot && shot.workflow && shot.workflow.machine;
     const hasProvenanceStatus = captured && Object.prototype.hasOwnProperty.call(captured, "provenanceStatus");
-    return !remotelyPostedShotIds.has(shot.id) &&
+    return !wasUploaded(shot) &&
       !permanentlyRejectedShotIds.has(shot.id) &&
       !extras.uploaded_to_decent &&
       !extras.decent_upload_rejected &&
@@ -369,6 +436,28 @@ function createPlugin(host) {
       (hasProvenanceStatus
         ? captured.provenanceStatus === "captured" && capturedMachine(shot) !== null
         : !captured || !captured.serialNumber || capturedMachine(shot) !== null);
+  }
+
+  function wasUploaded(shot) {
+    return Boolean(shot && (
+      remotelyPostedShotIds.has(shot.id) ||
+      uploadedMachinesByShotId.has(shot.id) ||
+      uploadedRevisionsByShotId.has(shot.id) ||
+      extrasFor(shot).uploaded_to_decent
+    ));
+  }
+
+  function reconciliationReplacement(shot) {
+    if (!wasUploaded(shot) || typeof shot.updatedAt !== "string" || !shot.updatedAt) return false;
+    const rejected = extrasFor(shot).decent_upload_rejected;
+    if (rejected && rejected.updatedAt === shot.updatedAt) return false;
+    const synced = uploadedRevisionsByShotId.get(shot.id);
+    if (synced) return shot.updatedAt !== synced;
+    const uploadedAt = Number(extrasFor(shot).uploaded_to_decent);
+    const updatedAt = Date.parse(shot.updatedAt);
+    if (uploadedAt > 0 && Number.isFinite(updatedAt) && Math.floor(updatedAt / 1000) > uploadedAt) return true;
+    recordUploadedRevision(shot);
+    return false;
   }
 
   function setReconcileOffset(offset) {
@@ -388,6 +477,12 @@ function createPlugin(host) {
       if (!await confirmReconciliationIsSafe()) return;
       let pages = 0;
       let attempts = 0;
+      for (const shotId of pendingReplacementShotIds) {
+        if (attempts >= RECONCILE_BATCH_SIZE || !state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe()) break;
+        const error = await uploadAutomatically({ shotId, replace: true });
+        attempts++;
+        if (error && !error.skipped && pendingReplacementShotIds.has(shotId)) throw error;
+      }
       while (pages < RECONCILE_PAGE_LIMIT && attempts < RECONCILE_BATCH_SIZE && state.autoUpload && !reconciliationPausedForConsent && !unloaded && reconciliationIsSafe()) {
         const page = await fetchLocal(`/shots?limit=${RECONCILE_PAGE_SIZE}&offset=${state.reconcileOffset}&order=desc`);
         if (!page || !Array.isArray(page.items)) throw new Error("could not list local shots");
@@ -398,15 +493,16 @@ function createPlugin(host) {
         let scanned = 0;
         for (const shot of page.items) {
           if (!state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe() || attempts >= RECONCILE_BATCH_SIZE) break;
-          while (pendingLiveShotIds.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent) {
+          while (pendingLiveShots.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent) {
             await uploadAutomatically(takeLiveShot());
             attempts++;
           }
           if (reconciliationPausedForConsent || attempts >= RECONCILE_BATCH_SIZE) break;
           scanned++;
-          if (!reconcileCandidate(shot)) continue;
+          const replace = reconciliationReplacement(shot);
+          if (!replace && !reconcileCandidate(shot)) continue;
           try {
-            await uploadShot(shot.id, false);
+            await uploadShot(shot.id, { replace });
             attempts++;
           } catch (e) {
             if (e.skipped) continue;
@@ -430,9 +526,9 @@ function createPlugin(host) {
       nextDelay = e.consent ? null : RECONCILE_RETRY_MS;
     } finally {
       isReconciling = false;
-      const nextShotId = reconciliationPausedForConsent ? null : takeLiveShot();
-      if (nextShotId) {
-        autoUpload(nextShotId);
+      const nextOperation = reconciliationPausedForConsent ? null : takeLiveShot();
+      if (nextOperation) {
+        autoUpload(nextOperation.shotId, nextOperation.replace);
         scheduleReconcile(RECONCILE_CONTINUE_MS);
       } else if (nextDelay !== null) {
         scheduleReconcile(nextDelay);
@@ -447,6 +543,25 @@ function createPlugin(host) {
   function escHtml(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
       { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function isUploaderBookkeepingPatch(patch) {
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) return false;
+    if (Object.keys(patch).length !== 1 || !patch.annotations) return false;
+    const annotations = patch.annotations;
+    if (typeof annotations !== "object" || Array.isArray(annotations) || Object.keys(annotations).length !== 1 || !annotations.extras) return false;
+    const extras = annotations.extras;
+    if (typeof extras !== "object" || Array.isArray(extras)) return false;
+    const keys = Object.keys(extras);
+    return keys.length > 0 && keys.every((key) => key === "uploaded_to_decent" || key === "decent_upload_rejected" || key === "visualizerId");
+  }
+
+  async function handleShotUpdated(shotId) {
+    const shot = await fetchLocal(`/shots/${shotId}`);
+    if (!shot || !shot.id) return;
+    const replace = wasUploaded(shot);
+    if (replace) markReplacementPending(shotId);
+    autoUpload(shotId, replace);
   }
 
   // Human-readable page listing the most recent uploads, each linking to the shot
@@ -500,6 +615,9 @@ function createPlugin(host) {
       try { host.storage({ type: "read", key: "lastUploadedShot" }); } catch (e) {}
       try { host.storage({ type: "read", key: "reconcileOffset" }); } catch (e) {}
       try { host.storage({ type: "read", key: "recentUploads" }); } catch (e) {}
+      try { host.storage({ type: "read", key: "uploadedMachines" }); } catch (e) {}
+      try { host.storage({ type: "read", key: "uploadedRevisions" }); } catch (e) {}
+      try { host.storage({ type: "read", key: "pendingReplacementShotIds" }); } catch (e) {}
       log(`loaded (autoUpload ${state.autoUpload})`);
       scheduleReconcile(1000);
     },
@@ -508,7 +626,7 @@ function createPlugin(host) {
       unloaded = true;
       if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
       reconcileTimerId = null;
-      pendingLiveShotIds = [];
+      pendingLiveShots = [];
     },
 
     onEvent(event) {
@@ -516,6 +634,14 @@ function createPlugin(host) {
         case "shotStored": {
           const id = event.payload && event.payload.id;
           if (id && state.autoUpload) autoUpload(id);
+          break;
+        }
+        case "shotUpdated": {
+          const payload = event.payload || {};
+          // Marker PUTs emit shotUpdated too; only suppress patches exclusively owned by this uploader.
+          if (payload.id && !isUploaderBookkeepingPatch(payload.patch)) {
+            handleShotUpdated(payload.id).catch((e) => log(`could not classify updated shot ${payload.id}: ${e.message}`));
+          }
           break;
         }
         case "storageRead":
@@ -529,6 +655,27 @@ function createPlugin(host) {
           if (event.payload && event.payload.key === "recentUploads") {
             const v = event.payload.value;
             state.recentUploads = Array.isArray(v) ? v.slice(0, RECENT_MAX) : [];
+          }
+          if (event.payload && event.payload.key === "uploadedMachines") {
+            const v = event.payload.value;
+            const stored = v && typeof v === "object" && !Array.isArray(v)
+              ? Object.entries(v)
+                .map(([shotId, machine]) => [shotId, capturedMachine({ workflow: { machine } })])
+                .filter(([, machine]) => machine)
+              : [];
+            uploadedMachinesByShotId = new Map([...stored, ...uploadedMachinesByShotId]);
+          }
+          if (event.payload && event.payload.key === "uploadedRevisions") {
+            const v = event.payload.value;
+            const stored = v && typeof v === "object" && !Array.isArray(v)
+              ? Object.entries(v).filter(([shotId, revision]) => shotId && typeof revision === "string" && revision)
+              : [];
+            uploadedRevisionsByShotId = new Map([...stored, ...uploadedRevisionsByShotId]);
+          }
+          if (event.payload && event.payload.key === "pendingReplacementShotIds") {
+            const ids = Array.isArray(event.payload.value) ? event.payload.value.filter((id) => typeof id === "string" && id) : [];
+            pendingReplacementShotIds = new Set([...pendingReplacementShotIds, ...ids]);
+            if (pendingReplacementShotIds.size > 0) scheduleReconcile(0);
           }
           break;
         case "stateUpdate": {
@@ -545,7 +692,7 @@ function createPlugin(host) {
           if (!state.autoUpload) {
             if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
             reconcileTimerId = null;
-            pendingLiveShotIds = [];
+            pendingLiveShots = [];
           } else if (state.autoUpload) {
             if (!wasEnabled) {
               reconciliationPausedForConsent = false;
@@ -586,7 +733,7 @@ function createPlugin(host) {
         try {
           const latest = await fetchLocal("/shots/latest");
           if (!latest || !latest.id) return jsonResponse(404, { ok: false, error: "no shot available" });
-          const result = await uploadShot(latest.id, true);
+          const result = await uploadShot(latest.id, { manualRetry: true });
           return jsonResponse(200, { ok: true, id: latest.id, url: state.lastUrl, result: result });
         } catch (e) {
           if (e.skipped) return jsonResponse(200, { ok: false, skipped: true, error: e.message });
