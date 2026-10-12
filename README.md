@@ -6,7 +6,7 @@ This repository is the plugin's source of truth. Decaid bundles a pinned, checks
 
 ## Install
 
-Download `shot-upload.reaplugin-vX.Y.Z.zip` from Releases and install it through Decaid's plugin settings, or install the repository's `main` branch through Decaid.
+Download `shot-upload.reaplugin-vX.Y.Z.zip` from Releases and install it through Decaid's plugin settings.
 
 Automatic upload is off by default. Open the shot-upload page to accept or decline
 the first-use invitation. Acceptance enables uploads of new and eligible saved
@@ -46,8 +46,8 @@ The `shotUploaded` event also carries `{id, sn, url}` for the just-uploaded shot
 
 Edit upload logic in `src/plugin.js` and the page in `src/ui.html`. The small,
 dependency-free Node packaging step embeds the HTML into the required single
-distributable script. Commit the generated `shot-upload.reaplugin/plugin.js` so
-direct branch installs work. Do not edit the generated script by hand.
+distributable script. Commit the generated `shot-upload.reaplugin/plugin.js` with
+source changes. Do not edit the generated script by hand.
 
 ```bash
 node scripts/build.js
@@ -58,6 +58,16 @@ node --test test/*.test.js
 ```
 
 The tests exercise the public plugin lifecycle and HTTP interfaces with an in-memory Decaid host.
+
+For local native testing, use Decaid's `PUT
+/api/v1/plugins/shot-upload.reaplugin/source` endpoint with `{manifest, plugin}`
+from the distributable files and keep `AutoUpload` off until the account and test
+shot are approved. Debug Decaid builds restore bundled plugin source on startup;
+reapply the candidate after restarting. Invitation state remains in host storage.
+
+The current Decaid GitHub branch installer accepts only one archive wrapper
+level. This repository's nested `.reaplugin` directory does not resolve through
+that installer yet; use the release ZIP or the local source endpoint instead.
 
 ## Release
 
