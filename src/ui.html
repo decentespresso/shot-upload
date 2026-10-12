@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shot uploads</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f4f5f6; color: #202326; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; }
+    main { max-width: 760px; margin: auto; }
+    header { border-bottom: 1px solid #cdd1d4; padding-bottom: 20px; }
+    h1 { margin: 0 0 12px; font-size: 28px; }
+    h2 { margin: 0 0 16px; font-size: 20px; }
+    p { line-height: 1.5; }
+    section { padding: 24px 0; border-bottom: 1px solid #cdd1d4; }
+    label { display: flex; align-items: center; gap: 12px; min-height: 44px; font-weight: 600; }
+    input { width: 20px; height: 20px; flex: none; accent-color: #007f68; }
+    button { font: inherit; min-height: 44px; padding: 10px 16px; border: 1px solid #a9b0b5; border-radius: 6px; background: #fff; color: #202326; cursor: pointer; }
+    button.primary { background: #007661; color: #fff; border-color: #007661; }
+    button:disabled { opacity: .5; cursor: default; }
+    :focus-visible { outline: 3px solid #2772cc; outline-offset: 3px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+    .muted { color: #535d64; }
+    .error { color: #b3261e; }
+    .error:empty { display: none; }
+    #account { margin: 0; }
+    #result { min-height: 24px; }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li { padding: 16px 0; border-top: 1px solid #cdd1d4; }
+    li:first-child { border-top: 0; }
+    a { color: #1762a8; overflow-wrap: anywhere; }
+    .meta { margin-top: 6px; color: #535d64; font-size: 14px; overflow-wrap: anywhere; }
+    dialog { max-width: 500px; width: calc(100% - 32px); max-height: calc(100% - 32px); padding: 24px; border: 1px solid #a9b0b5; border-radius: 8px; background: #fff; color: #202326; }
+    dialog::backdrop { background: rgb(0 0 0 / .45); }
+    dialog h2 { font-size: 22px; }
+    dialog p { margin-bottom: 0; }
+    @media (max-width: 420px) { body { padding: 16px; } dialog { padding: 20px; } .actions button { flex: 1 1 auto; } }
+    @media (prefers-color-scheme: dark) {
+      :root { background: #181b1d; color: #edf0f1; }
+      header, section, li { border-color: #42494e; }
+      button, dialog { background: #262b2e; color: #edf0f1; border-color: #69747c; }
+      .muted, .meta { color: #b7c0c6; }
+      .error { color: #ffb4ab; }
+      a { color: #8bbffc; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Shot uploads</h1>
+      <p id="account" role="status">Checking Decent account...</p>
+      <p id="accountHelp" class="muted" hidden>Link your account in Decaid's native Account settings to enable uploads.</p>
+    </header>
+    <section aria-label="Upload controls">
+      <label for="automatic"><input id="automatic" type="checkbox" disabled>Upload shots automatically</label>
+      <div class="actions">
+        <button id="upload" class="primary" type="button" disabled>Upload latest shot</button>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+      <p id="result" role="status"></p>
+      <p id="error" class="error" role="alert"></p>
+    </section>
+    <section aria-labelledby="recentHeading">
+      <h2 id="recentHeading">Recent uploads</h2>
+      <ul id="recent"><li class="muted">Loading...</li></ul>
+    </section>
+  </main>
+  <dialog id="invitation" aria-labelledby="invitationTitle" aria-describedby="invitationDescription">
+    <h2 id="invitationTitle">Upload your shot data to Decent?</h2>
+    <p id="invitationDescription">Upload shot measurements, profiles, machine and equipment details, and annotations to your linked Decent account for shot history and Decent's shot analysis. This includes eligible saved shots.</p>
+    <p id="invitationAccount" class="muted" hidden>Link your account in Decaid's native Account settings to enable uploads.</p>
+    <p id="invitationError" class="error" role="alert"></p>
+    <div class="actions">
+      <button id="decline" type="button" autofocus>No thanks</button>
+      <button id="enable" class="primary" type="button">Enable uploads</button>
+    </div>
+  </dialog>
+  <script>
+    "use strict";
+    const base = "/api/v1/plugins/shot-upload.reaplugin";
+    const element = (id) => document.getElementById(id);
+    const automatic = element("automatic");
+    const invitation = element("invitation");
+    let state = { autoUpload: false, invitationSeen: false };
+    let loggedIn = false;
+    let ready = false;
+    let busy = false;
+    let returnFocus = automatic;
+
+    async function request(url, body) {
+      const response = await fetch(url, body === undefined ? {} : {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error("Could not save or load upload settings. Try again.");
+      return response.json();
+    }
+
+    function setBusy(value) {
+      busy = value;
+      automatic.disabled = busy || !ready || (!loggedIn && !state.autoUpload);
+      element("enable").disabled = busy || !ready || !loggedIn;
+      element("decline").disabled = busy;
+      element("upload").disabled = busy || !ready || !loggedIn;
+      element("refresh").disabled = busy;
+    }
+
+    function recentUploads(shots) {
+      const rows = (Array.isArray(shots) ? shots : []).map((shot) => {
+        const row = document.createElement("li");
+        let url;
+        try {
+          const candidate = new URL(shot.url);
+          if (candidate.protocol === "https:" && candidate.hostname === "decentespresso.com" && !candidate.username && !candidate.password) url = candidate.href;
+        } catch (error) {}
+        const label = document.createElement(url ? "a" : "span");
+        label.textContent = shot.title || shot.id || "Shot";
+        if (url) { label.href = url; label.target = "_blank"; label.rel = "noopener noreferrer"; }
+        row.appendChild(label);
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        const date = new Date(shot.ts);
+        meta.textContent = [shot.sn ? `SN ${shot.sn}` : "", Number.isFinite(date.getTime()) ? date.toLocaleString() : ""].filter(Boolean).join(" | ");
+        row.appendChild(meta);
+        return row;
+      });
+      if (!rows.length) {
+        const row = document.createElement("li");
+        row.textContent = "No shots uploaded yet.";
+        row.className = "muted";
+        rows.push(row);
+      }
+      element("recent").replaceChildren(...rows);
+    }
+
+    async function refresh() {
+      if (busy) return;
+      let openInvitation = false;
+      setBusy(true);
+      element("error").textContent = "";
+      try {
+        const [status, account] = await Promise.all([request(`${base}/status`), request("/api/v1/account/decent")]);
+        state = status;
+        loggedIn = account.loggedIn === true;
+        ready = true;
+        automatic.checked = state.autoUpload === true;
+        element("account").textContent = loggedIn ? "Decent account linked" : "Decent account not linked";
+        element("accountHelp").hidden = loggedIn;
+        element("invitationAccount").hidden = loggedIn;
+        recentUploads(status.recentUploads);
+        if (!state.autoUpload && !state.invitationSeen && !invitation.open) {
+          const active = document.activeElement;
+          returnFocus = active && active !== document.body ? active : automatic;
+          openInvitation = true;
+        }
+      } catch (error) {
+        ready = false;
+        element("error").textContent = "Could not load upload status. Refresh to retry.";
+      } finally {
+        setBusy(false);
+        if (openInvitation) {
+          invitation.showModal();
+          element("decline").focus();
+        }
+      }
+    }
+
+    async function acknowledge() {
+      if (state.invitationSeen) return;
+      await request(`${base}/invitation`, {});
+      state = { ...state, invitationSeen: true };
+    }
+
+    async function saveAutomatic(enabled) {
+      try {
+        await request(`${base}/settings`, { AutoUpload: enabled });
+      } catch (error) {
+        if (enabled) {
+          try { await request(`${base}/settings`, { AutoUpload: false }); } catch (rollbackError) {
+            throw new Error("Upload settings could not be confirmed. Turn off automatic uploads in Decaid's native plugin settings before retrying.");
+          }
+        }
+        throw error;
+      }
+      state = { ...state, autoUpload: enabled };
+      automatic.checked = enabled;
+    }
+
+    async function answerInvitation(enabled) {
+      if (busy || (enabled && (!ready || !loggedIn))) return;
+      setBusy(true);
+      element("invitationError").textContent = "";
+      element("error").textContent = "";
+      try {
+        await acknowledge();
+        if (enabled) await saveAutomatic(true);
+        invitation.close();
+      } catch (error) {
+        element("invitationError").textContent = error.message;
+        element("error").textContent = error.message;
+        automatic.checked = state.autoUpload === true;
+      } finally {
+        setBusy(false);
+        if (!invitation.open) (returnFocus.disabled ? element("refresh") : returnFocus).focus();
+      }
+    }
+
+    automatic.addEventListener("change", async () => {
+      const enabled = automatic.checked;
+      automatic.checked = state.autoUpload === true;
+      if (busy || !ready || (enabled && !loggedIn)) return;
+      setBusy(true);
+      element("error").textContent = "";
+      try {
+        if (enabled) await acknowledge();
+        await saveAutomatic(enabled);
+      } catch (error) {
+        element("error").textContent = error.message;
+      } finally {
+        automatic.checked = state.autoUpload === true;
+        setBusy(false);
+      }
+    });
+    element("decline").addEventListener("click", () => answerInvitation(false));
+    element("enable").addEventListener("click", () => answerInvitation(true));
+    invitation.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      return answerInvitation(false);
+    });
+    element("refresh").addEventListener("click", refresh);
+    element("upload").addEventListener("click", async () => {
+      if (busy || !ready || !loggedIn) return;
+      setBusy(true);
+      element("error").textContent = "";
+      element("result").textContent = "Uploading...";
+      try {
+        const result = await request(`${base}/upload`, {});
+        element("result").textContent = result.ok ? "Shot uploaded." : "Shot not uploaded.";
+        if (!result.ok) element("error").textContent = result.error || "No eligible shot available.";
+      } catch (error) {
+        element("result").textContent = "";
+        element("error").textContent = "Upload failed. Try again.";
+      } finally {
+        setBusy(false);
+      }
+      await refresh();
+    });
+    window.addEventListener("focus", refresh);
+    refresh();
+  </script>
+</body>
+</html>

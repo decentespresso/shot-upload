@@ -23,8 +23,11 @@ jobs:
       - name: Validate plugin
         run: |
           set -euo pipefail
+          node scripts/build.js --check
+          node scripts/build.js
+          node --check src/plugin.js
           node --check shot-upload.reaplugin/plugin.js
-          node --test test/plugin.test.js
+          node --test test/*.test.js
           test -s shot-upload.reaplugin/plugin.js
           test -s shot-upload.reaplugin/manifest.json
           jq -e '.id == "shot-upload.reaplugin"' shot-upload.reaplugin/manifest.json >/dev/null
