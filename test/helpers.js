@@ -83,6 +83,7 @@ function loadPlugin({
   annotationStatus = 200,
   beforeProxy,
   notificationsAvailable = true,
+  notificationResults = [{ status: 'accepted' }],
   machineListResponses = [],
   registeredSerials = [...new Set([
     ...shots.map((item) => item.workflow?.machine?.serialNumber).filter(Boolean),
@@ -194,9 +195,16 @@ function loadPlugin({
   vm.runInContext(fs.readFileSync(pluginPath, "utf8"), context);
   const statuses = [...responseStatuses];
   const lists = [...machineListResponses];
+  const deliveries = notificationResults === null ? null : [...notificationResults];
   const plugin = context.createPlugin({
     ...(notificationsAvailable ? {
-      notify(value) { notifications.push(value); },
+      notify(value) {
+        notifications.push(value);
+        const requestId = `notification-${notifications.length}`;
+        const result = deliveries === null ? null : deliveries.shift() || { status: 'accepted' };
+        if (result) Promise.resolve().then(() => plugin.onEvent({ name: 'notificationResult', payload: { ...result, requestId, id: value.id } }));
+        return requestId;
+      },
       dismissNotification(id) { dismissedNotifications.push(id); },
     } : {}),
     log() {},

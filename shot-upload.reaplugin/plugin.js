@@ -58,7 +58,8 @@ function createPlugin(host) {
   let pausedSerials = new Set();
   let pausedShotSerials = new Map();
   let authenticationPaused = false;
-  let ownershipNoticeOutstanding = false;
+  let pauseNotice = null;
+  let noticeRetryTimerId = null;
   const state = {
     autoUpload: false, // opt-in; see header
     lengthThreshold: 5,
@@ -70,6 +71,38 @@ function createPlugin(host) {
     machineState: null,
   };
   function log(msg) { try { host.log(`[shot-upload] ${msg}`); } catch (e) {} }
+  function cancelNoticeRetry() {
+    if (noticeRetryTimerId !== null) clearTimeout(noticeRetryTimerId);
+    noticeRetryTimerId = null;
+  }
+  function publishPauseNotice() {
+    cancelNoticeRetry();
+    const notice = pauseNotice;
+    if (unloaded || !notice ||
+        (notice.payload.id === "authentication" ? !authenticationPaused : authenticationPaused || !pausedSerials.has(notice.serialNumber))) return;
+    try {
+      const requestId = host.notify?.(notice.payload);
+      pauseNotice = { ...notice, requestId, status: typeof requestId === "string" ? "pending" : "accepted" };
+    } catch (error) {
+      pauseNotice = { ...notice, status: "rejected" };
+      log(`could not show upload pause: ${error.message}`);
+    }
+  }
+  function handleNotificationResult(result) {
+    if (!pauseNotice || pauseNotice.status !== "pending" || result?.requestId !== pauseNotice.requestId || result?.id !== pauseNotice.payload.id) return;
+    if (result.status === "accepted") {
+      cancelNoticeRetry();
+      pauseNotice = { ...pauseNotice, status: "accepted" };
+    } else if (result.status === "rejected") {
+      pauseNotice = { ...pauseNotice, status: "rejected" };
+      if (result.reason === "capacity" || result.reason === "storage") {
+        noticeRetryTimerId = setTimeout(() => {
+          noticeRetryTimerId = null;
+          publishPauseNotice();
+        }, RECONCILE_RETRY_MS);
+      }
+    }
+  }
   function pauseUpload(reason, serialNumber) {
     const message = reason === "authentication"
       ? "Shot uploads are paused. Please sign in to your Decent account again."
@@ -79,17 +112,21 @@ function createPlugin(host) {
     else pausedSerials = new Set([...pausedSerials, serialNumber]);
     if (!alreadyPaused) {
       host.emit("uploadPaused", { reason, serialNumber: serialNumber || null, message, timestamp: Date.now() });
-      try {
-        const authentication = reason === "authentication";
-        if (authentication) host.dismissNotification?.("ownership");
-        if (authentication || !ownershipNoticeOutstanding) {
-          host.notify?.({ id: authentication ? "authentication" : "ownership", message, action: authentication
-          ? { id: "signIn", label: "Sign In", type: "openDecentAccount" }
-          : { id: "support", label: "Support", type: "openExternalUrl", url: "https://decentespresso.com/support/" } });
-          ownershipNoticeOutstanding = !authentication;
-        }
-      } catch (error) { log(`could not show upload pause: ${error.message}`); }
     }
+    try {
+      const authentication = reason === "authentication";
+      if (authentication && pauseNotice?.payload.id !== "authentication") {
+        cancelNoticeRetry();
+        host.dismissNotification?.("ownership");
+        pauseNotice = null;
+      }
+      if (!pauseNotice) {
+        pauseNotice = { serialNumber, status: "pending", payload: { id: authentication ? "authentication" : "ownership", message, action: authentication
+          ? { id: "signIn", label: "Sign In", type: "openDecentAccount" }
+          : { id: "support", label: "Support", type: "openExternalUrl", url: "https://decentespresso.com/support/" } } };
+        publishPauseNotice();
+      }
+    } catch (error) { log(`could not show upload pause: ${error.message}`); }
     return skipped(message, false);
   }
   async function checkAccountSerial(serialNumber) {
@@ -112,6 +149,11 @@ function createPlugin(host) {
             if (lines.some((line) => /^0\s/.test(line) || !/^[A-Za-z0-9._-]+\s+DE-[A-Za-z0-9._+-]+$/.test(line))) throw new Error("unexpected account machine list response");
             accountSerials = new Set(lines.map((line) => line.split(/\s+/)[0]));
             pausedSerials = new Set([...pausedSerials].filter((serial) => !accountSerials.has(serial)));
+            if (pauseNotice?.payload.id === "ownership" && !pausedSerials.has(pauseNotice.serialNumber) && pausedSerials.size > 0) {
+              cancelNoticeRetry();
+              pauseNotice = null;
+              pauseUpload("unlinked_serial", [...pausedSerials][0]);
+            }
           } catch (error) {
             if (generation !== accountGeneration || unloaded) throw skipped("account changed during machine lookup", false);
             if (!error.skipped) machineListRetryAfter = Date.now() + RECONCILE_RETRY_MS;
@@ -565,6 +607,11 @@ function createPlugin(host) {
           break;
         }
       }
+      if (generation === accountGeneration && accountSerials !== null && !authenticationPaused && pausedSerials.size === 0 && state.reconcileOffset === 0) {
+        cancelNoticeRetry();
+        pauseNotice = null;
+        host.dismissNotification?.();
+      }
       if (attempts >= RECONCILE_BATCH_SIZE || pendingReplacementIterator !== null) nextDelay = RECONCILE_CONTINUE_MS;
     } catch (e) {
       log(`reconciliation paused: ${e.message}`);
@@ -660,19 +707,32 @@ function createPlugin(host) {
     },
     onUnload() {
       unloaded = true;
+      cancelNoticeRetry();
+      pauseNotice = null;
       if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
       reconcileTimerId = null;
       pendingLiveShots = [];
     },
     onEvent(event) {
       switch (event.name) {
-        case "notificationDismissed":
-          if (event.payload?.id === "ownership") ownershipNoticeOutstanding = false;
+        case "notificationResult":
+          handleNotificationResult(event.payload);
           break;
         case "notificationAction":
           if (event.payload?.id !== "ownership" || event.payload?.actionId !== "support" || event.payload?.phase !== "returned" || pausedSerials.size === 0) break;
+          accountGeneration++;
+          accountSerials = null;
+          pausedShotSerials = new Map();
+          pendingReplacementIterator = null;
+          accountRequest = null;
+          machineListRetryAfter = 0;
+          setReconcileOffset(0);
+          scheduleReconcile(0);
+          break;
         case "decentAccountChanged":
-          try { host.dismissNotification?.(); ownershipNoticeOutstanding = false; } catch (error) { log(`could not clear upload pauses: ${error.message}`); }
+          cancelNoticeRetry();
+          pauseNotice = null;
+          try { host.dismissNotification?.(); } catch (error) { log(`could not clear upload pauses: ${error.message}`); }
           accountGeneration++;
           accountSerials = null;
           pausedSerials = new Set();

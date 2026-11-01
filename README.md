@@ -49,18 +49,28 @@ The status endpoint includes `pausedSerials` and `authenticationPaused`.
 The plugin supplies the native notice through `host.notify`: `ownership` opens
 its HTTPS Support URL, while `authentication` opens native account settings.
 An outstanding ownership notice stays current when more serials pause, so an
-active Support action is not retired by backlog scanning. A targeted
-`notificationDismissed` for `ownership` acknowledges that notice without clearing
-any upload pause. A different serial pausing for the first time then gets a fresh
-Support notice; repeated shots from an already paused serial remain quiet.
+active Support action is not retired by backlog scanning. Reading a notice does
+not remove it or resume uploads; there is no generic user-dismissal event.
 Authentication replaces the ownership notice. Account changes clear only this
 plugin's notices. A targeted
 `notificationAction` with ID `ownership`, action
 `support`, and phase `returned` triggers a fresh ownership check. Merely opening
 the link, a failed launch, or an unrelated action cannot resume uploads.
-Decaid renders these through its generic permissioned banner without interpreting
+Decaid renders these through its native notification center without interpreting
 upload policy or clearing unrelated messages. The plugin's existing UI and
 `uploadPaused` event also retain their pause information.
+
+The plugin tracks pending, accepted and rejected notices separately from
+upload pauses. It correlates `notificationResult` with the request ID returned by
+`host.notify`. Capacity and storage rejection schedule a 60-second notice retry,
+including authentication notices. These retries do not reconcile or upload shots.
+Acceptance, resolution, account changes, supersession and unload cancel them.
+Validation rejection does not retry. Older hosts without request IDs retain the
+previous best-effort delivery behavior. Opening or closing Decaid's notification
+list does not resolve the pause or resume uploads. Returning from Support keeps
+the existing condition while ownership is checked again. An unchanged pause is
+not republished as a new occurrence. A completed successful reconciliation with
+no remaining pause withdraws the condition; it does not retain a resumed notice.
 
 ## Links to uploaded shots
 

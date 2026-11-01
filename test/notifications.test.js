@@ -27,6 +27,34 @@ test('authentication requests the approved account settings action', async () =>
   assert.equal(notice.action.url, undefined);
 });
 
+test('Support lookup outage retains the unresolved notice without uploading', async () => {
+  const harness = loadPlugin({ shots: [shot('a')], machineListResponses: [{ status: 200, body: '' }, { status: 503, body: '' }] });
+  await harness.runNextTimer();
+  harness.plugin.onEvent({ name: 'notificationAction', payload: { id: 'ownership', actionId: 'support', phase: 'returned' } });
+  await harness.runNextTimer();
+  assert.equal(harness.dismissedNotifications.length, 0);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.proxyCalls.length, 0);
+});
+
+test('resolving one serial revises the condition to the remaining paused serial', async () => {
+  const harness = loadPlugin({
+    shots: [shot('a'), shot('b', { serialNumber: '7000' })],
+    machineListResponses: [{ status: 200, body: '' }, { status: 200, body: '6262 DE-DE1PRO' }],
+  });
+  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'a' } });
+  await pump();
+  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'b' } });
+  await pump();
+  harness.plugin.onEvent({ name: 'notificationAction', payload: { id: 'ownership', actionId: 'support', phase: 'returned' } });
+  await harness.runNextTimer();
+  assert.equal(harness.notifications.length, 2);
+  assert.match(harness.notifications.at(-1).message, /serial 7000/);
+  const status = JSON.parse((await harness.plugin.__httpRequestHandler({ endpoint: 'status' })).body);
+  assert.deepEqual(status.pausedSerials, ['7000']);
+  assert.equal(harness.proxyCalls.length, 1);
+});
+
 test('additional paused serials do not replace an outstanding support action', async () => {
   const harness = loadPlugin({
     shots: [shot('a'), shot('b', { serialNumber: '7000' })],
@@ -38,7 +66,7 @@ test('additional paused serials do not replace an outstanding support action', a
   assert.equal(JSON.parse(response.body).pausedSerials.length, 2);
 });
 
-test('a new paused serial gets a notice after the previous ownership notice is dismissed', async () => {
+test('additional paused serials keep the same unresolved condition', async () => {
   const harness = loadPlugin({
     shots: [shot('a'), shot('b', { serialNumber: '7000' })],
     registeredSerials: [],
@@ -46,14 +74,13 @@ test('a new paused serial gets a notice after the previous ownership notice is d
   harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'a' } });
   await pump();
   assert.equal(harness.notifications.length, 1);
-  harness.plugin.onEvent({ name: 'notificationDismissed', payload: { id: 'ownership' } });
   harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'a' } });
   await pump();
   assert.equal(harness.notifications.length, 1);
   harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'b' } });
   await pump();
-  assert.equal(harness.notifications.length, 2);
-  assert.match(harness.notifications.at(-1).message, /serial 7000/);
+  assert.equal(harness.notifications.length, 1);
+  assert.match(harness.notifications.at(-1).message, /serial 6262/);
   assert.equal(harness.notifications.at(-1).action.id, 'support');
   assert.equal(harness.notifications.at(-1).action.type, 'openExternalUrl');
   assert.equal(harness.proxyCalls.length, 0);
@@ -61,17 +88,17 @@ test('a new paused serial gets a notice after the previous ownership notice is d
   assert.deepEqual(JSON.parse(response.body).pausedSerials, ['6262', '7000']);
 });
 
-test('unrelated user dismissals do not retire an outstanding ownership notice', async () => {
+test('returning from Support does not withdraw or republish an unresolved pause', async () => {
   const harness = loadPlugin({
-    shots: [shot('a'), shot('b', { serialNumber: '7000' })],
+    shots: [shot('a')],
     registeredSerials: [],
   });
-  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'a' } });
-  await pump();
-  harness.plugin.onEvent({ name: 'notificationDismissed', payload: { id: 'authentication' } });
-  harness.plugin.onEvent({ name: 'shotStored', payload: { id: 'b' } });
-  await pump();
+  await harness.runNextTimer();
+  harness.plugin.onEvent({ name: 'notificationAction', payload: { id: 'ownership', actionId: 'support', phase: 'returned' } });
+  assert.equal(harness.dismissedNotifications.length, 0);
+  await harness.runNextTimer();
   assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.proxyCalls.length, 0);
 });
 
 test('authentication supersedes the ownership notice without another support action', async () => {
@@ -128,4 +155,80 @@ test('missing optional notification methods do not bypass the ownership guard', 
   assert.equal(harness.emits.filter(event => event.name === 'uploadPaused').length, 1);
   const response = await harness.plugin.__httpRequestHandler({ endpoint: 'status' });
   assert.equal(JSON.parse(response.body).pausedSerials[0], '6262');
+});
+
+for (const reason of ['capacity', 'storage']) {
+  for (const authentication of [false, true]) {
+    test(`${reason} rejection retries ${authentication ? 'authentication' : 'ownership'} notices independently of paused reconciliation`, async () => {
+      const harness = loadPlugin({
+        shots: [shot('a')], registeredSerials: [],
+        machineListResponses: authentication ? [{ status: 401, body: '' }] : [],
+        notificationResults: [{ status: 'rejected', reason }, { status: 'accepted' }],
+      });
+      await harness.runNextTimer();
+      assert.equal(harness.notifications.length, 1);
+      assert.equal(harness.nextTimerDelay, 60000);
+      const checks = harness.machineListCalls.length;
+      await harness.runNextTimer();
+      assert.equal(harness.notifications.length, 2);
+      assert.equal(harness.machineListCalls.length, checks);
+      assert.equal(harness.proxyCalls.length, 0);
+      assert.equal(harness.nextTimerDelay, authentication ? null : 300000);
+      const status = JSON.parse((await harness.plugin.__httpRequestHandler({ endpoint: 'status' })).body);
+      assert.equal(status.authenticationPaused, authentication);
+      if (!authentication) assert.deepEqual(status.pausedSerials, ['6262']);
+    });
+  }
+}
+
+test('pending delivery is not accepted and stale results cannot resurrect retired notices', async () => {
+  const harness = loadPlugin({ shots: [shot('a')], registeredSerials: [], notificationResults: null });
+  await harness.runNextTimer();
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.nextTimerDelay, 300000);
+  harness.plugin.onEvent({ name: 'notificationResult', payload: { id: 'ownership', requestId: 'unrelated', status: 'rejected', reason: 'capacity' } });
+  assert.equal(harness.nextTimerDelay, 300000);
+  harness.plugin.onEvent({ name: 'decentAccountChanged', payload: {} });
+  harness.plugin.onEvent({ name: 'notificationResult', payload: { id: 'ownership', requestId: 'notification-1', status: 'rejected', reason: 'storage' } });
+  assert.equal(harness.nextTimerDelay, 0);
+  assert.equal(harness.proxyCalls.length, 0);
+});
+
+for (const event of ['decentAccountChanged', 'unload']) {
+  test(`${event} cancels rejected-notice retries without bypassing upload policy`, async () => {
+    const harness = loadPlugin({ shots: [shot('a')], registeredSerials: [], notificationResults: [{ status: 'rejected', reason: 'capacity' }] });
+    await harness.runNextTimer();
+    assert.equal(harness.nextTimerDelay, 60000);
+    if (event === 'unload') harness.plugin.onUnload();
+    else harness.plugin.onEvent({ name: event, payload: { id: 'ownership' } });
+    if (event === 'decentAccountChanged') {
+      assert.equal(harness.nextTimerDelay, 0);
+      await harness.runNextTimer();
+      assert.equal(harness.notifications.length, 2);
+    } else {
+      assert.equal(await harness.runNextTimer(), false);
+      assert.equal(harness.notifications.length, 1);
+    }
+    assert.equal(harness.proxyCalls.length, 0);
+  });
+}
+
+test('validation rejection does not start an endless retry', async () => {
+  const harness = loadPlugin({ shots: [shot('a')], registeredSerials: [], notificationResults: [{ status: 'rejected', reason: 'validation' }] });
+  await harness.runNextTimer();
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.nextTimerDelay, 300000);
+});
+
+test('authentication supersession cancels a rejected ownership retry', async () => {
+  const harness = loadPlugin({
+    shots: [shot('linked', { serialNumber: '7000' }), shot('missing')], registeredSerials: ['7000'], responseStatuses: [401],
+    notificationResults: [{ status: 'rejected', reason: 'capacity' }, { status: 'accepted' }],
+  });
+  await harness.runNextTimer();
+  assert.deepEqual(harness.notifications.map(notice => notice.id), ['ownership', 'authentication']);
+  assert.equal(harness.nextTimerDelay, null);
+  harness.plugin.onEvent({ name: 'notificationResult', payload: { id: 'ownership', requestId: 'notification-1', status: 'rejected', reason: 'storage' } });
+  assert.equal(await harness.runNextTimer(), false);
+  assert.equal(harness.proxyCalls.length, 1);
 });
