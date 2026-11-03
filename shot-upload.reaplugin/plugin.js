@@ -145,8 +145,8 @@ function createPlugin(host) {
             if (generation !== accountGeneration || unloaded) throw skipped("account changed during machine lookup", false);
             if (response && response.status === 401) throw pauseUpload("authentication", null);
             if (!response || response.status !== 200 || typeof response.body !== "string") throw new Error("account machine list temporarily unavailable");
-            const lines = response.body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-            if (lines.some((line) => /^0\s/.test(line) || !/^[A-Za-z0-9._-]+\s+DE-[A-Za-z0-9._+-]+$/.test(line))) throw new Error("unexpected account machine list response");
+            const lines = response.body.split(/\r\n?|\n/).map((line) => line.trim()).filter(Boolean);
+            if (lines.some((line) => /^0(?:\s|$)/.test(line) || !/^(?:\d+|DE1-\d+|[A-Za-z0-9._-]+\s+DE-[A-Za-z0-9._+-]+)$/.test(line))) throw new Error("unexpected account machine list response");
             accountSerials = new Set(lines.map((line) => line.split(/\s+/)[0]));
             pausedSerials = new Set([...pausedSerials].filter((serial) => !accountSerials.has(serial)));
             if (pauseNotice?.payload.id === "ownership" && !pausedSerials.has(pauseNotice.serialNumber) && pausedSerials.size > 0) {

@@ -22,7 +22,10 @@ for (const response of [{ status: 200, body: "" }, { status: 503, body: "offline
   });
 }
 
-for (const body of ["temporarilyUnavailable", "maintenance", "6262\nmaintenance", "6262"]) {
+for (const body of [
+  "temporarilyUnavailable", "maintenance", "6262\nmaintenance", "0 DE-DE1PRO",
+  "6262 invalid", "6262 DE-", "6262 DE-DE1PRO extra",
+]) {
   test(`unexpected machine-list text ${JSON.stringify(body)} backs off without an ownership notice`, async () => {
     const harness = loadPlugin({ shots: [shot("pending")], machineListResponses: [{ status: 200, body }] });
     await harness.runNextTimer();
@@ -30,6 +33,35 @@ for (const body of ["temporarilyUnavailable", "maintenance", "6262\nmaintenance"
     assert.deepEqual((await status(harness)).pausedSerials, []);
     assert.equal(harness.emits.some((event) => event.name === "uploadPaused"), false);
     assert.equal(harness.nextTimerDelay, 60000);
+  });
+}
+
+for (const { label, body, serials } of [
+  { label: "bare numeric serial", body: "6262", serials: ["6262"] },
+  { label: "bare DE1 serial", body: "DE1-0001", serials: ["DE1-0001"] },
+  ...["\n", "\r\n", "\r"].map((ending) => ({
+    label: `mixed rows separated by ${JSON.stringify(ending)}`,
+    body: ` \t6262\t${ending}${ending} DE1-0001\tDE-DE1PRO220V7-00533${ending}6262${ending} `,
+    serials: ["6262", "DE1-0001"],
+  })),
+]) {
+  test(`valid machine list with ${label} reaches successful uploads`, async () => {
+    const harness = loadPlugin({
+      shots: serials.map((serialNumber) => shot(`pending-${serialNumber}`, { serialNumber })),
+      machineListResponses: [{ status: 200, body }],
+    });
+    await harness.runNextTimer();
+    assert.equal(harness.machineListCalls.length, 1);
+    assert.deepEqual(
+      new Set(harness.proxyCalls.map((call) => JSON.parse(call.options.body).id)),
+      new Set(serials.map((serial) => `pending-${serial}`)),
+    );
+    assert.equal(harness.proxyCalls.length, serials.length);
+    assert.equal(harness.puts.length, serials.length);
+    assert.ok(harness.puts.every((put) => put.body.annotations.extras.uploaded_to_decent));
+    assert.deepEqual((await status(harness)).pausedSerials, []);
+    assert.equal(harness.notifications.length, 0);
+    assert.equal(harness.emits.some((event) => event.name === "uploadPaused"), false);
   });
 }
 

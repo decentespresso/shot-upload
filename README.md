@@ -23,8 +23,9 @@ HTTP 401 pauses the account's uploads and asks the user to sign in again.
 Machine-list outages or unexpected responses hold uploads with a one-minute
 backoff, without claiming the machine is unlinked. Existing transient upload
 retries and permanent document rejections, including HTTP 400, are unchanged.
-Nonempty machine-list rows must include the SKU requested by `withskus=1`;
-unexpected plain text is an outage, not an ownership determination.
+Machine-list rows accept bare numeric or `DE1-<digits>` serials, or serial/SKU
+pairs, with LF, CRLF, or CR line endings. The `0` sentinel and malformed or unexpected
+plain text are outages, not ownership determinations.
 
 Restarting refreshes ownership. Decaid's `decentAccountChanged` event also
 invalidates the cache; uploads resume only after the new lookup confirms the
