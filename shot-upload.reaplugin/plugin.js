@@ -18,12 +18,10 @@
  * Contract: must define createPlugin(host) returning {id, version, onLoad,
  * onUnload, onEvent}.
  */
-
 function createPlugin(host) {
   "use strict";
-
   const NS = "shot-upload.reaplugin";
-  const VERSION = "0.2.3";
+  const VERSION = "0.2.4";
   const LOCAL_API_URL = "http://localhost:8080/api/v1";
   const UPLOAD_PATH = "support/api/shot_upload"; // exact allowlisted proxy write path
   // Web view of an uploaded shot in the user's Decent account. The server returns
@@ -40,7 +38,6 @@ function createPlugin(host) {
   const RECONCILE_RETRY_MS = 60 * 1000;
   const RECONCILE_CONTINUE_MS = 30 * 1000;
   const SAFE_MACHINE_STATES = new Set(["idle", "schedIdle", "sleeping"]);
-
   let isUploading = false;
   let isReconciling = false;
   let pendingLiveShots = [];
@@ -49,11 +46,20 @@ function createPlugin(host) {
   let uploadedMachinesByShotId = new Map();
   let uploadedRevisionsByShotId = new Map();
   let pendingReplacementShotIds = new Set();
+  let pendingReplacementIterator = null;
   let reconcileTimerId = null;
   let reconciliationPausedForConsent = false;
   let unloaded = false;
   let decaidVersion = null;
-
+  let accountSerials = null;
+  let accountRequest = null;
+  let accountGeneration = 0;
+  let machineListRetryAfter = 0;
+  let pausedSerials = new Set();
+  let pausedShotSerials = new Map();
+  let authenticationPaused = false;
+  let pauseNotice = null;
+  let noticeRetryTimerId = null;
   const state = {
     autoUpload: false, // opt-in; see header
     lengthThreshold: 5,
@@ -64,29 +70,121 @@ function createPlugin(host) {
     reconcileOffset: 0,
     machineState: null,
   };
-
   function log(msg) { try { host.log(`[shot-upload] ${msg}`); } catch (e) {} }
-
+  function cancelNoticeRetry() {
+    if (noticeRetryTimerId !== null) clearTimeout(noticeRetryTimerId);
+    noticeRetryTimerId = null;
+  }
+  function publishPauseNotice() {
+    cancelNoticeRetry();
+    const notice = pauseNotice;
+    if (unloaded || !notice ||
+        (notice.payload.id === "authentication" ? !authenticationPaused : authenticationPaused || !pausedSerials.has(notice.serialNumber))) return;
+    try {
+      const requestId = host.notify?.(notice.payload);
+      pauseNotice = { ...notice, requestId, status: typeof requestId === "string" ? "pending" : "accepted" };
+    } catch (error) {
+      pauseNotice = { ...notice, status: "rejected" };
+      log(`could not show upload pause: ${error.message}`);
+    }
+  }
+  function handleNotificationResult(result) {
+    if (!pauseNotice || pauseNotice.status !== "pending" || result?.requestId !== pauseNotice.requestId || result?.id !== pauseNotice.payload.id) return;
+    if (result.status === "accepted") {
+      cancelNoticeRetry();
+      pauseNotice = { ...pauseNotice, status: "accepted" };
+    } else if (result.status === "rejected") {
+      pauseNotice = { ...pauseNotice, status: "rejected" };
+      if (result.reason === "capacity" || result.reason === "storage") {
+        noticeRetryTimerId = setTimeout(() => {
+          noticeRetryTimerId = null;
+          publishPauseNotice();
+        }, RECONCILE_RETRY_MS);
+      }
+    }
+  }
+  function pauseUpload(reason, serialNumber) {
+    const message = reason === "authentication"
+      ? "Shot uploads are paused. Please sign in to your Decent account again."
+      : `Shot uploads are paused: your machine (serial ${serialNumber}) isn't linked to your Decent account yet. Your shots will upload automatically once the machine is linked and ownership is checked again.`;
+    const alreadyPaused = reason === "authentication" ? authenticationPaused : pausedSerials.has(serialNumber);
+    if (reason === "authentication") authenticationPaused = true;
+    else pausedSerials = new Set([...pausedSerials, serialNumber]);
+    if (!alreadyPaused) {
+      host.emit("uploadPaused", { reason, serialNumber: serialNumber || null, message, timestamp: Date.now() });
+    }
+    try {
+      const authentication = reason === "authentication";
+      if (authentication && pauseNotice?.payload.id !== "authentication") {
+        cancelNoticeRetry();
+        host.dismissNotification?.("ownership");
+        pauseNotice = null;
+      }
+      if (!pauseNotice) {
+        pauseNotice = { serialNumber, status: "pending", payload: { id: authentication ? "authentication" : "ownership", message, action: authentication
+          ? { id: "signIn", label: "Sign In", type: "openDecentAccount" }
+          : { id: "support", label: "Support", type: "openExternalUrl", url: "https://decentespresso.com/support/" } } };
+        publishPauseNotice();
+      }
+    } catch (error) { log(`could not show upload pause: ${error.message}`); }
+    return skipped(message, false);
+  }
+  async function checkAccountSerial(serialNumber) {
+    await Promise.resolve();
+    if (authenticationPaused) throw pauseUpload("authentication", null);
+    if (accountSerials !== null && pausedSerials.has(serialNumber)) throw pauseUpload("unlinked_serial", serialNumber);
+    if (accountSerials === null) {
+      if (Date.now() < machineListRetryAfter) throw new Error("account machine list temporarily unavailable");
+      if (!accountRequest) {
+        const generation = accountGeneration;
+        accountRequest = (async () => {
+          try {
+            const response = await host.decentProxy("support/api/sn", {
+              method: "GET", query: { onlyespressomachines: "1", withskus: "1" },
+            });
+            if (generation !== accountGeneration || unloaded) throw skipped("account changed during machine lookup", false);
+            if (response && response.status === 401) throw pauseUpload("authentication", null);
+            if (!response || response.status !== 200 || typeof response.body !== "string") throw new Error("account machine list temporarily unavailable");
+            const lines = response.body.split(/\r\n?|\n/).map((line) => line.trim()).filter(Boolean);
+            if (lines.some((line) => /^0(?:\s|$)/.test(line) || !/^(?:\d+|DE1-\d+|[A-Za-z0-9._-]+\s+DE-[A-Za-z0-9._+-]+)$/.test(line))) throw new Error("unexpected account machine list response");
+            accountSerials = new Set(lines.map((line) => line.split(/\s+/)[0]));
+            pausedSerials = new Set([...pausedSerials].filter((serial) => !accountSerials.has(serial)));
+            if (pauseNotice?.payload.id === "ownership" && !pausedSerials.has(pauseNotice.serialNumber) && pausedSerials.size > 0) {
+              cancelNoticeRetry();
+              pauseNotice = null;
+              pauseUpload("unlinked_serial", [...pausedSerials][0]);
+            }
+          } catch (error) {
+            if (generation !== accountGeneration || unloaded) throw skipped("account changed during machine lookup", false);
+            if (!error.skipped) machineListRetryAfter = Date.now() + RECONCILE_RETRY_MS;
+            if (error.code === "account_consent_denied") error.consent = true;
+            if (error.code === "account_authentication_required") throw pauseUpload("authentication", null);
+            throw error;
+          } finally { if (generation === accountGeneration) accountRequest = null; }
+        })();
+      }
+      await accountRequest;
+    }
+    if (!accountSerials) throw skipped("account changed during machine lookup", false);
+    if (!accountSerials.has(serialNumber)) throw pauseUpload("unlinked_serial", serialNumber);
+  }
   // Web URL for a shot the server stored, e.g.
   // https://decentespresso.com/support/espressomachine?view=chart&sn=6262&id=<id>
   function shotUrl(sn, id) {
     if (!sn || !id) return null;
     return `${SHOT_VIEW_BASE}?view=chart&sn=${encodeURIComponent(sn)}&id=${encodeURIComponent(id)}`;
   }
-
   // Prepend an upload to the recent list (dedup by shot id), cap at RECENT_MAX,
   // and persist it so the links survive a restart.
   function recordRecentUpload(entry) {
     state.recentUploads = [entry, ...state.recentUploads.filter((e) => e && e.id !== entry.id)].slice(0, RECENT_MAX);
     try { host.storage({ type: "write", key: "recentUploads", data: state.recentUploads }); } catch (e) {}
   }
-
   async function fetchLocal(path) {
     const res = await fetch(`${LOCAL_API_URL}${path}`);
     if (!res.ok) { log(`local ${path} -> ${res.status}`); return null; }
     return await res.json();
   }
-
   async function updateShotExtras(shotId, extras) {
     const res = await fetch(`${LOCAL_API_URL}/shots/${shotId}`, {
       method: "PUT",
@@ -95,7 +193,6 @@ function createPlugin(host) {
     });
     if (!res || !res.ok) throw new Error(`mark ${shotId} -> HTTP ${res && res.status}`);
   }
-
   async function markUploaded(shotId) {
     try {
       await updateShotExtras(shotId, {
@@ -106,7 +203,6 @@ function createPlugin(host) {
       log(`could not mark ${shotId} uploaded: ${e.message}`);
     }
   }
-
   async function markRejected(shotId, error) {
     try {
       await updateShotExtras(shotId, {
@@ -120,7 +216,6 @@ function createPlugin(host) {
       log(`could not mark ${shotId} rejected: ${e.message}`);
     }
   }
-
   // Decaid app version (for provenance), cached.
   async function getDecaidVersion() {
     if (decaidVersion) return decaidVersion;
@@ -128,7 +223,6 @@ function createPlugin(host) {
     decaidVersion = (info && (info.version || info.fullVersion)) || "unknown";
     return decaidVersion;
   }
-
   // seconds between first and last measurement
   function shotDuration(shot) {
     const m = shot && shot.measurements;
@@ -137,7 +231,6 @@ function createPlugin(host) {
     const t1 = Date.parse(m[m.length - 1].machine.timestamp);
     return isNaN(t0) || isNaN(t1) ? 0 : (t1 - t0) / 1000;
   }
-
   function capturedMachine(shot) {
     const machine = shot && shot.workflow && shot.workflow.machine;
     if (!machine || !machine.serialNumber || /^mock/i.test(String(machine.serialNumber))) return null;
@@ -147,18 +240,15 @@ function createPlugin(host) {
       ...(machine.model ? { model: String(machine.model) } : {}),
     };
   }
-
   function recordUploadedMachine(shotId, machine) {
     uploadedMachinesByShotId = new Map([...uploadedMachinesByShotId, [shotId, { ...machine }]]);
     try { host.storage({ type: "write", key: "uploadedMachines", data: Object.fromEntries(uploadedMachinesByShotId) }); } catch (e) {}
   }
-
   function recordUploadedRevision(shot) {
     if (!shot || typeof shot.updatedAt !== "string" || !shot.updatedAt) return;
     uploadedRevisionsByShotId = new Map([...uploadedRevisionsByShotId, [shot.id, shot.updatedAt]]);
     try { host.storage({ type: "write", key: "uploadedRevisions", data: Object.fromEntries(uploadedRevisionsByShotId) }); } catch (e) {}
   }
-
   async function withMachine(shot, manualRetry, replacementMachine) {
     const captured = shot && shot.workflow && shot.workflow.machine;
     let machine = capturedMachine(shot);
@@ -197,9 +287,9 @@ function createPlugin(host) {
       schemaVersion: 1,
     };
   }
-
   // POST the shot through the authenticated Decent proxy (reuses account login).
   async function postShot(shot, replace) {
+    await checkAccountSerial(shot.machine.serialNumber);
     const body = JSON.stringify(shot);
     let lastErr = null;
     for (let i = 0; i < RETRIES; i++) {
@@ -209,6 +299,8 @@ function createPlugin(host) {
       if (isReconciling && !reconciliationIsSafe()) {
         throw skipped("machine is active");
       }
+      await checkAccountSerial(shot.machine.serialNumber);
+      const generation = accountGeneration;
       try {
         const res = await host.decentProxy(UPLOAD_PATH, {
           method: "POST",
@@ -221,6 +313,9 @@ function createPlugin(host) {
         if (status >= 200 && status < 300) {
           try { return JSON.parse(text); } catch (e) { return { ok: true }; }
         }
+        if (generation !== accountGeneration || unloaded) throw skipped("account changed during upload", false);
+        if (status === 401) throw pauseUpload("authentication", null);
+        if (status === 403) throw pauseUpload("unlinked_serial", shot.machine.serialNumber);
         const error = new Error(`HTTP ${status}: ${text}`);
         error.status = status;
         error.permanent = status >= 400 && status < 500 && status !== 401 && status !== 403 && status !== 408 && status !== 429;
@@ -229,7 +324,10 @@ function createPlugin(host) {
         }
         lastErr = error;
       } catch (e) {
+        if (generation !== accountGeneration || unloaded) throw skipped("account changed during upload", false);
         lastErr = e;
+        if (e.skipped) throw e;
+        if (e.code === "account_authentication_required") throw pauseUpload("authentication", null);
         if (e.code === "account_consent_denied") {
           e.consent = true;
           throw e;
@@ -240,34 +338,31 @@ function createPlugin(host) {
     }
     throw lastErr || new Error("upload failed");
   }
-
   function extrasFor(shot) {
     return shot && shot.annotations && shot.annotations.extras || {};
   }
-
   function skipped(message, terminal = false) {
     const error = new Error(message);
     error.skipped = true;
     error.terminal = terminal;
     return error;
   }
-
   async function uploadShot(shotId, { manualRetry = false, replace = false } = {}) {
+    await Promise.resolve();
+    if (authenticationPaused) throw pauseUpload("authentication", null);
+    if (pausedShotSerials.has(shotId)) throw pauseUpload("unlinked_serial", pausedShotSerials.get(shotId));
     if (!replace && remotelyPostedShotIds.has(shotId)) throw skipped(`shot ${shotId} already uploaded`, true);
     if (!replace && !manualRetry && permanentlyRejectedShotIds.has(shotId)) throw skipped(`shot ${shotId} was rejected`, true);
     const full = await fetchLocal(`/shots/${shotId}`);
     if (!full || !full.id) throw skipped(`shot ${shotId} not found`, true);
-
     const extras = extrasFor(full);
     if (!replace && extras.uploaded_to_decent) throw skipped(`shot ${shotId} already uploaded`, true);
     if (!replace && extras.decent_upload_rejected && !manualRetry) throw skipped(`shot ${shotId} was rejected`, true);
     if (extras.upload_skipped === "mock-device") throw skipped(`shot ${shotId} came from a mock device`, true);
-
     const dur = shotDuration(full);
     if (!replace && dur < state.lengthThreshold) {
       throw skipped(`shot too short (${dur.toFixed(1)}s < ${state.lengthThreshold}s)`, true);
     }
-
     const replacementMachine = replace ? (uploadedMachinesByShotId.get(full.id) || null) : undefined;
     const payload = await withMachine(full, manualRetry, replacementMachine);
     if (!payload) {
@@ -278,11 +373,13 @@ function createPlugin(host) {
         : Boolean(captured.serialNumber) && capturedMachine(full) === null));
       throw skipped("no real machine serial available", terminal);
     }
-
     let result;
     try {
       result = await postShot(payload, replace);
     } catch (e) {
+      if (e.skipped && pausedSerials.has(payload.machine.serialNumber)) {
+        pausedShotSerials = new Map([...pausedShotSerials, [shotId, payload.machine.serialNumber]]);
+      }
       if (e.permanent) {
         permanentlyRejectedShotIds.add(full.id);
         if (typeof full.updatedAt === "string" && full.updatedAt) e.updatedAt = full.updatedAt;
@@ -313,7 +410,6 @@ function createPlugin(host) {
     host.emit("shotUploaded", { shotId: full.id, id: serverId, sn: sn || null, url: url, result: result, timestamp: Date.now() });
     return result;
   }
-
   function queueLiveShot(operation) {
     const queued = pendingLiveShots.find((item) => item.shotId === operation.shotId);
     pendingLiveShots = queued
@@ -322,29 +418,24 @@ function createPlugin(host) {
         : item)
       : [...pendingLiveShots, operation];
   }
-
   function takeLiveShot() {
     const operation = pendingLiveShots[0];
     pendingLiveShots = pendingLiveShots.slice(1);
     return operation;
   }
-
   function persistPendingReplacements() {
     try { host.storage({ type: "write", key: "pendingReplacementShotIds", data: [...pendingReplacementShotIds] }); } catch (e) {}
   }
-
   function markReplacementPending(shotId) {
     if (pendingReplacementShotIds.has(shotId)) return;
     pendingReplacementShotIds = new Set([...pendingReplacementShotIds, shotId]);
     persistPendingReplacements();
   }
-
   function clearReplacementPending(shotId) {
     if (!pendingReplacementShotIds.has(shotId)) return;
     pendingReplacementShotIds = new Set([...pendingReplacementShotIds].filter((id) => id !== shotId));
     persistPendingReplacements();
   }
-
   async function uploadAutomatically(operation) {
     const { shotId, replace } = operation;
     if (replace) markReplacementPending(shotId);
@@ -376,14 +467,14 @@ function createPlugin(host) {
       return e;
     }
   }
-
   async function autoUpload(shotId, replace = false) {
-    if (!state.autoUpload || reconciliationPausedForConsent || unloaded) return;
+    if (!state.autoUpload || reconciliationPausedForConsent || authenticationPaused || unloaded) return;
     const operation = { shotId, replace };
     if (isUploading || isReconciling) {
       queueLiveShot(operation);
       return;
     }
+    const generation = accountGeneration;
     isUploading = true;
     try {
       await uploadAutomatically(operation);
@@ -391,39 +482,34 @@ function createPlugin(host) {
       isUploading = false;
       const nextOperation = takeLiveShot();
       if (nextOperation) autoUpload(nextOperation.shotId, nextOperation.replace);
+      if (generation !== accountGeneration) scheduleReconcile(0);
     }
   }
-
   function applySettings(settings) {
     if (!settings) return;
     // Opt-in: default OFF unless the user explicitly enabled it.
     state.autoUpload = settings.AutoUpload === true;
     state.lengthThreshold = settings.LengthThreshold !== undefined ? settings.LengthThreshold : 5;
   }
-
   function scheduleReconcile(delay) {
-    if (!state.autoUpload || reconciliationPausedForConsent || unloaded) return;
+    if (!state.autoUpload || reconciliationPausedForConsent || authenticationPaused || unloaded) return;
     if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
     reconcileTimerId = setTimeout(() => {
       reconcileTimerId = null;
       reconcile();
     }, delay);
   }
-
   function currentMachineState(snapshot) {
     return snapshot && snapshot.state && snapshot.state.state || null;
   }
-
   function reconciliationIsSafe() {
     return SAFE_MACHINE_STATES.has(state.machineState);
   }
-
   async function confirmReconciliationIsSafe() {
     const snapshot = await fetchLocal("/machine/state");
     state.machineState = currentMachineState(snapshot);
     return reconciliationIsSafe();
   }
-
   function reconcileCandidate(shot) {
     const extras = extrasFor(shot);
     const captured = shot && shot.workflow && shot.workflow.machine;
@@ -437,7 +523,6 @@ function createPlugin(host) {
         ? captured.provenanceStatus === "captured" && capturedMachine(shot) !== null
         : !captured || !captured.serialNumber || capturedMachine(shot) !== null);
   }
-
   function wasUploaded(shot) {
     return Boolean(shot && (
       remotelyPostedShotIds.has(shot.id) ||
@@ -446,7 +531,6 @@ function createPlugin(host) {
       extrasFor(shot).uploaded_to_decent
     ));
   }
-
   function reconciliationReplacement(shot) {
     if (!wasUploaded(shot) || typeof shot.updatedAt !== "string" || !shot.updatedAt) return false;
     const rejected = extrasFor(shot).decent_upload_rejected;
@@ -459,31 +543,35 @@ function createPlugin(host) {
     recordUploadedRevision(shot);
     return false;
   }
-
   function setReconcileOffset(offset) {
     state.reconcileOffset = offset;
     host.storage({ type: "write", key: "reconcileOffset", data: offset });
   }
-
   async function reconcile() {
-    if (!state.autoUpload || reconciliationPausedForConsent || unloaded) return;
+    if (!state.autoUpload || reconciliationPausedForConsent || authenticationPaused || unloaded) return;
     if (isUploading || isReconciling) {
       scheduleReconcile(RECONCILE_RETRY_MS);
       return;
     }
+    const generation = accountGeneration;
     isReconciling = true;
     let nextDelay = RECONCILE_PERIOD_MS;
     try {
       if (!await confirmReconciliationIsSafe()) return;
       let pages = 0;
       let attempts = 0;
-      for (const shotId of pendingReplacementShotIds) {
-        if (attempts >= RECONCILE_BATCH_SIZE || !state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe()) break;
+      if (!pendingReplacementIterator) pendingReplacementIterator = pendingReplacementShotIds.values();
+      for (let scanned = 0; scanned < RECONCILE_BATCH_SIZE; scanned++) {
+        if (attempts >= RECONCILE_BATCH_SIZE || !state.autoUpload || reconciliationPausedForConsent || authenticationPaused || unloaded || generation !== accountGeneration || !reconciliationIsSafe()) break;
+        const next = pendingReplacementIterator.next();
+        if (next.done) { pendingReplacementIterator = null; break; }
+        const shotId = next.value;
+        if (!pendingReplacementShotIds.has(shotId)) continue;
         const error = await uploadAutomatically({ shotId, replace: true });
-        attempts++;
+        if (!error || !error.skipped) attempts++;
         if (error && !error.skipped && pendingReplacementShotIds.has(shotId)) throw error;
       }
-      while (pages < RECONCILE_PAGE_LIMIT && attempts < RECONCILE_BATCH_SIZE && state.autoUpload && !reconciliationPausedForConsent && !unloaded && reconciliationIsSafe()) {
+      while (pages < RECONCILE_PAGE_LIMIT && attempts < RECONCILE_BATCH_SIZE && state.autoUpload && !reconciliationPausedForConsent && !authenticationPaused && !unloaded && reconciliationIsSafe()) {
         const page = await fetchLocal(`/shots?limit=${RECONCILE_PAGE_SIZE}&offset=${state.reconcileOffset}&order=desc`);
         if (!page || !Array.isArray(page.items)) throw new Error("could not list local shots");
         if (page.items.length === 0 || state.reconcileOffset >= page.total) {
@@ -492,12 +580,12 @@ function createPlugin(host) {
         }
         let scanned = 0;
         for (const shot of page.items) {
-          if (!state.autoUpload || reconciliationPausedForConsent || unloaded || !reconciliationIsSafe() || attempts >= RECONCILE_BATCH_SIZE) break;
-          while (pendingLiveShots.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent) {
+          if (!state.autoUpload || reconciliationPausedForConsent || authenticationPaused || unloaded || !reconciliationIsSafe() || attempts >= RECONCILE_BATCH_SIZE) break;
+          while (pendingLiveShots.length > 0 && attempts < RECONCILE_BATCH_SIZE && !reconciliationPausedForConsent && !authenticationPaused) {
             await uploadAutomatically(takeLiveShot());
             attempts++;
           }
-          if (reconciliationPausedForConsent || attempts >= RECONCILE_BATCH_SIZE) break;
+          if (reconciliationPausedForConsent || authenticationPaused || attempts >= RECONCILE_BATCH_SIZE) break;
           scanned++;
           const replace = reconciliationReplacement(shot);
           if (!replace && !reconcileCandidate(shot)) continue;
@@ -519,32 +607,35 @@ function createPlugin(host) {
           break;
         }
       }
-      if (attempts >= RECONCILE_BATCH_SIZE) nextDelay = RECONCILE_CONTINUE_MS;
+      if (generation === accountGeneration && accountSerials !== null && !authenticationPaused && pausedSerials.size === 0 && state.reconcileOffset === 0) {
+        cancelNoticeRetry();
+        pauseNotice = null;
+        host.dismissNotification?.();
+      }
+      if (attempts >= RECONCILE_BATCH_SIZE || pendingReplacementIterator !== null) nextDelay = RECONCILE_CONTINUE_MS;
     } catch (e) {
       log(`reconciliation paused: ${e.message}`);
       if (e.consent) reconciliationPausedForConsent = true;
       nextDelay = e.consent ? null : RECONCILE_RETRY_MS;
     } finally {
       isReconciling = false;
+      if (generation !== accountGeneration) setReconcileOffset(0);
       const nextOperation = reconciliationPausedForConsent ? null : takeLiveShot();
       if (nextOperation) {
         autoUpload(nextOperation.shotId, nextOperation.replace);
-        scheduleReconcile(RECONCILE_CONTINUE_MS);
+        scheduleReconcile(generation !== accountGeneration ? 0 : RECONCILE_CONTINUE_MS);
       } else if (nextDelay !== null) {
-        scheduleReconcile(nextDelay);
+        scheduleReconcile(generation !== accountGeneration ? 0 : nextDelay);
       }
     }
   }
-
   function jsonResponse(status, obj) {
     return { status: status, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) };
   }
-
   function escHtml(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
       { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
-
   function isUploaderBookkeepingPatch(patch) {
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return false;
     if (Object.keys(patch).length !== 1 || !patch.annotations) return false;
@@ -555,7 +646,6 @@ function createPlugin(host) {
     const keys = Object.keys(extras);
     return keys.length > 0 && keys.every((key) => key === "uploaded_to_decent" || key === "decent_upload_rejected" || key === "visualizerId");
   }
-
   async function handleShotUpdated(shotId) {
     const shot = await fetchLocal(`/shots/${shotId}`);
     if (!shot || !shot.id) return;
@@ -563,7 +653,6 @@ function createPlugin(host) {
     if (replace) markReplacementPending(shotId);
     autoUpload(shotId, replace);
   }
-
   // Human-readable page listing the most recent uploads, each linking to the shot
   // in the user's Decent account. Big tap targets — it may be shown on the DE1's
   // touchscreen.
@@ -599,38 +688,62 @@ function createPlugin(host) {
     .meta, .empty, .nourl { color: #9a9aa5; }
   }
 </style></head>
-<body><h1>Recent uploaded shots</h1><ul class="shots">${list}</ul></body></html>`;
+<body><h1>Recent uploaded shots</h1>${authenticationPaused ? '<p role="alert">Shot uploads are paused. Please sign in to your Decent account again.</p>' : ""}${[...pausedSerials].map((serial) => `<p role="alert">Shot uploads are paused: machine ${escHtml(serial)} isn't linked to your Decent account. <a href="https://decentespresso.com/support/">Contact support</a> to link it.</p>`).join("")}<ul class="shots">${list}</ul></body></html>`;
   }
-
   return {
     id: NS,
     version: VERSION,
-
     onLoad(settings) {
       unloaded = false;
       reconciliationPausedForConsent = false;
       applySettings(settings);
       // Storage reads are event-based: this triggers a `storageRead` event,
       // handled in onEvent, that restores lastUploadedShot.
-      try { host.storage({ type: "read", key: "lastUploadedShot" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "reconcileOffset" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "recentUploads" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "uploadedMachines" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "uploadedRevisions" }); } catch (e) {}
-      try { host.storage({ type: "read", key: "pendingReplacementShotIds" }); } catch (e) {}
+      for (const key of ["lastUploadedShot", "reconcileOffset", "recentUploads", "uploadedMachines", "uploadedRevisions", "pendingReplacementShotIds"]) {
+        try { host.storage({ type: "read", key }); } catch (e) {}
+      }
       log(`loaded (autoUpload ${state.autoUpload})`);
       scheduleReconcile(1000);
     },
-
     onUnload() {
       unloaded = true;
+      cancelNoticeRetry();
+      pauseNotice = null;
       if (reconcileTimerId !== null) clearTimeout(reconcileTimerId);
       reconcileTimerId = null;
       pendingLiveShots = [];
     },
-
     onEvent(event) {
       switch (event.name) {
+        case "notificationResult":
+          handleNotificationResult(event.payload);
+          break;
+        case "notificationAction":
+          if (event.payload?.id !== "ownership" || event.payload?.actionId !== "support" || event.payload?.phase !== "returned" || pausedSerials.size === 0) break;
+          accountGeneration++;
+          accountSerials = null;
+          pausedShotSerials = new Map();
+          pendingReplacementIterator = null;
+          accountRequest = null;
+          machineListRetryAfter = 0;
+          setReconcileOffset(0);
+          scheduleReconcile(0);
+          break;
+        case "decentAccountChanged":
+          cancelNoticeRetry();
+          pauseNotice = null;
+          try { host.dismissNotification?.(); } catch (error) { log(`could not clear upload pauses: ${error.message}`); }
+          accountGeneration++;
+          accountSerials = null;
+          pausedSerials = new Set();
+          pausedShotSerials = new Map();
+          pendingReplacementIterator = null;
+          accountRequest = null;
+          machineListRetryAfter = 0;
+          authenticationPaused = false;
+          setReconcileOffset(0);
+          scheduleReconcile(0);
+          break;
         case "shotStored": {
           const id = event.payload && event.payload.id;
           if (id && state.autoUpload) autoUpload(id);
@@ -704,7 +817,6 @@ function createPlugin(host) {
         }
       }
     },
-
     // Control endpoints. GET status; POST upload of the latest eligible shot.
     async __httpRequestHandler(request) {
       const endpoint = request && request.endpoint;
@@ -715,6 +827,8 @@ function createPlugin(host) {
           lastResult: state.lastResult,
           lastUrl: state.lastUrl,
           recentUploads: state.recentUploads,
+          pausedSerials: [...pausedSerials],
+          authenticationPaused,
         });
       }
       // JSON list of the recent uploads with their links (for programmatic use).

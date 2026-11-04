@@ -10,6 +10,69 @@ Download `shot-upload.reaplugin-vX.Y.Z.zip` from Releases and install it through
 
 Automatic upload is off by default. Enable **Upload shots automatically** in the plugin settings to opt in.
 
+## Upload pauses
+
+Before uploading, the plugin checks the shot's original serial against
+`support/api/sn?onlyespressomachines=1&withskus=1` through Decaid's authenticated
+proxy. A missing serial or an upload HTTP 403 pauses that serial for the session;
+other linked machines can keep uploading. Live, backlog, replacement, and manual
+uploads share this guard. The plugin preserves paused shots without rewriting
+their machine identity or marking them permanently rejected.
+
+HTTP 401 pauses the account's uploads and asks the user to sign in again.
+Machine-list outages or unexpected responses hold uploads with a one-minute
+backoff, without claiming the machine is unlinked. Existing transient upload
+retries and permanent document rejections, including HTTP 400, are unchanged.
+Machine-list rows accept bare numeric or `DE1-<digits>` serials, or serial/SKU
+pairs, with LF, CRLF, or CR line endings. The `0` sentinel and malformed or unexpected
+plain text are outages, not ownership determinations.
+
+Restarting refreshes ownership. Decaid's `decentAccountChanged` event also
+invalidates the cache; uploads resume only after the new lookup confirms the
+serial is linked. Restart is a check trigger, not a recovery prerequisite.
+Serial pauses and their notification deduplication are reset on each account
+generation, so a new account never inherits the previous account's notices.
+Returning from the native Support action invalidates the uploader cache; its
+own authenticated lookup/backoff determines recovery. Account changes during
+an active request discard stale failures and trigger immediate reconciliation.
+The plugin needs `proxy.decent_api`, `proxy.decent_api.write`, and `notifications`.
+This version requires a Decaid host supporting the generic notification contract;
+older hosts that reject unknown permissions cannot load its manifest.
+
+Pending replacements scan at most five entries per pass, independently of the
+upload budget, and continue from their previous position. Known paused shots do
+not reload their full records until ownership is refreshed. Authentication pauses
+stop both replacement and backlog scans immediately.
+
+The status endpoint includes `pausedSerials` and `authenticationPaused`.
+`uploadPaused` carries `{reason, serialNumber, message, timestamp}`, with reason
+`unlinked_serial` or `authentication` and a null serial for authentication.
+The plugin supplies the native notice through `host.notify`: `ownership` opens
+its HTTPS Support URL, while `authentication` opens native account settings.
+An outstanding ownership notice stays current when more serials pause, so an
+active Support action is not retired by backlog scanning. Reading a notice does
+not remove it or resume uploads; there is no generic user-dismissal event.
+Authentication replaces the ownership notice. Account changes clear only this
+plugin's notices. A targeted
+`notificationAction` with ID `ownership`, action
+`support`, and phase `returned` triggers a fresh ownership check. Merely opening
+the link, a failed launch, or an unrelated action cannot resume uploads.
+Decaid renders these through its native notification center without interpreting
+upload policy or clearing unrelated messages. The plugin's existing UI and
+`uploadPaused` event also retain their pause information.
+
+The plugin tracks pending, accepted and rejected notices separately from
+upload pauses. It correlates `notificationResult` with the request ID returned by
+`host.notify`. Capacity and storage rejection schedule a 60-second notice retry,
+including authentication notices. These retries do not reconcile or upload shots.
+Acceptance, resolution, account changes, supersession and unload cancel them.
+Validation rejection does not retry. Older hosts without request IDs retain the
+previous best-effort delivery behavior. Opening or closing Decaid's notification
+list does not resolve the pause or resume uploads. Returning from Support keeps
+the existing condition while ownership is checked again. An unchanged pause is
+not republished as a new occurrence. A completed successful reconciliation with
+no remaining pause withdraws the condition; it does not retain a resumed notice.
+
 ## Links to uploaded shots
 
 After a shot uploads, the plugin records a link to view it in the user's Decent
@@ -29,7 +92,7 @@ The distributable source is plain JavaScript and JSON under `shot-upload.reaplug
 
 ```bash
 node --check shot-upload.reaplugin/plugin.js
-node --test test/plugin.test.js
+node --test test/*.test.js
 ```
 
 The tests exercise the public plugin lifecycle and HTTP interfaces with an in-memory Decaid host.
