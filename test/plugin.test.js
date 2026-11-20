@@ -2,6 +2,16 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { loadPlugin, pump, shot } = require("./helpers");
 
+function assertGzipShotPost(call, { replace }) {
+  assert.equal(call.path, "support/api/shot_upload");
+  assert.deepEqual(Object.keys(call.options).sort(), ["body", "contentType", "gzip", "method", "query"]);
+  assert.equal(call.options.method, "POST");
+  assert.equal(call.options.contentType, "application/json");
+  assert.equal(call.options.gzip, true);
+  assert.equal(typeof call.options.body, "string");
+  assert.deepEqual({ ...call.options.query }, replace ? { replace: "1" } : {});
+}
+
 test("automatic upload remains opt-in", async () => {
   const harness = loadPlugin({ settings: {}, shots: [shot("shot-1", { uploaded: true })] });
 
@@ -28,6 +38,7 @@ test("shotStored uploads the persisted shot with captured identity", async () =>
   assert.equal(harness.proxyCalls.length, 1);
   assert.equal(harness.proxyCalls[0].path, "support/api/shot_upload");
   assert.equal(Object.keys(harness.proxyCalls[0].options.query).length, 0);
+  assertGzipShotPost(harness.proxyCalls[0], { replace: false });
   const payload = JSON.parse(harness.proxyCalls[0].options.body);
   assert.equal(payload.id, "shot-1");
   assert.equal(payload.machine.serialNumber, "6262");
@@ -55,6 +66,7 @@ test("shotUpdated replaces an uploaded shot with its latest persisted metadata",
   assert.equal(harness.proxyCalls.length, 1);
   assert.equal(harness.proxyCalls[0].path, "support/api/shot_upload");
   assert.equal(harness.proxyCalls[0].options.query.replace, "1");
+  assertGzipShotPost(harness.proxyCalls[0], { replace: true });
   assert.equal(JSON.parse(harness.proxyCalls[0].options.body).annotations.espressoNotes, "updated note");
   assert.equal(Boolean(harness.puts[0].body.annotations.extras.uploaded_to_decent), true);
 });
@@ -591,6 +603,10 @@ test("transient failures retry on a later reconciliation pass", async () => {
   }
 
   assert.equal(harness.proxyCalls.length, 4);
+  for (const call of harness.proxyCalls) {
+    assertGzipShotPost(call, { replace: false });
+    assert.equal(call.options.body, harness.proxyCalls[0].options.body);
+  }
   assert.equal(Boolean(harness.puts.at(-1).body.annotations.extras.uploaded_to_decent), true);
 });
 
@@ -633,6 +649,7 @@ test("manual upload may use the connected machine after unavailable capture", as
 
   assert.equal(response.status, 200);
   assert.equal(harness.proxyCalls.length, 1);
+  assertGzipShotPost(harness.proxyCalls[0], { replace: false });
   const payload = JSON.parse(harness.proxyCalls[0].options.body);
   assert.equal(payload.machine.serialNumber, "9999");
 });

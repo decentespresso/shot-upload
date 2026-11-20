@@ -21,7 +21,7 @@
 function createPlugin(host) {
   "use strict";
   const NS = "shot-upload.reaplugin";
-  const VERSION = "0.2.4";
+  const VERSION = "0.2.5";
   const LOCAL_API_URL = "http://localhost:8080/api/v1";
   const UPLOAD_PATH = "support/api/shot_upload"; // exact allowlisted proxy write path
   // Web view of an uploaded shot in the user's Decent account. The server returns
@@ -307,6 +307,7 @@ function createPlugin(host) {
           query: replace ? { replace: "1" } : {},
           body: body,
           contentType: "application/json",
+          gzip: true,
         });
         const status = res && res.status;
         const text = (res && res.body) || "";
